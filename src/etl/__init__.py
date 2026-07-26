@@ -13,6 +13,7 @@ from src.etl.exceptions import (
     ETLValidationError,
 )
 from src.etl.pipeline import ETLPipeline, ETLRunResult
+from src.etl.clean import CleaningEngine, CleaningResult
 from src.etl.quality import DataQualityReport
 from src.etl.schema_validator import (
     ColumnRule,
@@ -33,6 +34,8 @@ __all__ = [
     "ETLValidationError",
     "ETLPipeline",
     "ETLRunResult",
+    "CleaningEngine",
+    "CleaningResult",
     "DataQualityReport",
     "ColumnRule",
     "SchemaDefinition",
