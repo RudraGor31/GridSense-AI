@@ -1,301 +1,363 @@
-"""Time-based feature generation for Phase 4.3.
+"""Time-based feature engineering for Phase 4.3.
 
-Extracts temporal features from a configurable timestamp column.  All features
-are derived using the Python standard library ``datetime`` module — no external
-dependencies required.
+Derives calendar and cyclical temporal features from an ISO-8601 UTC timestamp
+column.  All features are configuration-driven — the column name and which
+features to generate are specified via :class:`TimeFeaturesConfig`.
 
 Generated features
 ------------------
-- ``year``              – Calendar year (int)
+- ``year``              – 4-digit year (int)
 - ``quarter``           – Calendar quarter 1-4 (int)
-- ``month``             – Month number 1-12 (int)
-- ``month_name``        – Month name e.g. ``"January"`` (str)
-- ``week_of_year``      – ISO week number 1-53 (int)
-- ``day_of_month``      – Day within month 1-31 (int)
-- ``day_of_week``       – ISO weekday 1 (Mon) – 7 (Sun) (int)
-- ``day_name``          – Day name e.g. ``"Monday"`` (str)
+- ``month``             – Month 1-12 (int)
+- ``month_name``        – Full English month name (str)
+- ``week``              – ISO week number 1-53 (int)
+- ``day``               – Day of month 1-31 (int)
+- ``day_of_week``       – Day of week 0=Mon … 6=Sun (int)
+- ``day_name``          – Full English day name (str)
 - ``is_weekend``        – True if Sat or Sun (bool)
 - ``is_business_day``   – True if Mon-Fri (bool)
-- ``hour``              – Hour of day 0-23 (int)
+- ``is_holiday``        – True if date appears in the holidays set (bool)
+- ``hour``              – Hour 0-23 (int)
 - ``minute``            – Minute 0-59 (int)
-- ``season``            – One of ``"Spring"``, ``"Summer"``, ``"Autumn"``, ``"Winter"`` (str)
-- ``financial_quarter`` – FY quarter based on April-March cycle (int)
-- ``is_holiday``        – Configurable holiday flag (bool); always False unless
-                          holiday dates are supplied via configuration.
-- ``time_of_day``       – Categorical: ``"Night"``, ``"Morning"``,
-                          ``"Afternoon"``, ``"Evening"`` (str)
+- ``season``            – "Spring" / "Summer" / "Autumn" / "Winter" (Northern Hemisphere) (str)
+- ``financial_quarter`` – Financial quarter label "Q1"-"Q4" based on April fiscal year start (str)
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set
 
 from src.features.feature_metadata import FeatureMetadata
-from src.features.feature_registry import registry
 
 # ---------------------------------------------------------------------------
-# Constants
+# Season & financial-quarter lookup tables
 # ---------------------------------------------------------------------------
+
+_MONTH_TO_SEASON: Dict[int, str] = {
+    1: "Winter",
+    2: "Winter",
+    3: "Spring",
+    4: "Spring",
+    5: "Spring",
+    6: "Summer",
+    7: "Summer",
+    8: "Summer",
+    9: "Autumn",
+    10: "Autumn",
+    11: "Autumn",
+    12: "Winter",
+}
+
+# India / Germany fiscal year starts April 1
+_MONTH_TO_FIN_QUARTER: Dict[int, str] = {
+    4: "Q1",
+    5: "Q1",
+    6: "Q1",
+    7: "Q2",
+    8: "Q2",
+    9: "Q2",
+    10: "Q3",
+    11: "Q3",
+    12: "Q3",
+    1: "Q4",
+    2: "Q4",
+    3: "Q4",
+}
 
 _MONTH_NAMES = [
-    "January", "February", "March", "April", "May", "June",
-    "July", "August", "September", "October", "November", "December",
+    "",
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
 ]
 
 _DAY_NAMES = [
-    "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday",
-]
-
-# Northern-hemisphere seasons (month-based approximation)
-_SEASONS: List[Tuple[str, Set[int]]] = [
-    ("Spring", {3, 4, 5}),
-    ("Summer", {6, 7, 8}),
-    ("Autumn", {9, 10, 11}),
-    ("Winter", {12, 1, 2}),
-]
-
-# Time-of-day buckets (hour boundaries are inclusive lower bound)
-_TIME_BUCKETS: List[Tuple[str, int, int]] = [
-    ("Night",     0,  5),
-    ("Morning",   6, 11),
-    ("Afternoon", 12, 16),
-    ("Evening",   17, 21),
-    ("Night",     22, 23),
-]
-
-# ---------------------------------------------------------------------------
-# Metadata registration
-# ---------------------------------------------------------------------------
-
-_TIME_METADATA: List[FeatureMetadata] = [
-    FeatureMetadata(
-        name="year", description="Calendar year", formula="datetime.year",
-        input_columns=["timestamp"], output_type="int", category="time",
-        valid_min=2000, valid_max=2100,
-    ),
-    FeatureMetadata(
-        name="quarter", description="Calendar quarter (1-4)",
-        formula="ceil(month / 3)", input_columns=["timestamp"],
-        output_type="int", category="time", valid_min=1, valid_max=4,
-    ),
-    FeatureMetadata(
-        name="month", description="Month number (1-12)",
-        formula="datetime.month", input_columns=["timestamp"],
-        output_type="int", category="time", valid_min=1, valid_max=12,
-    ),
-    FeatureMetadata(
-        name="month_name", description="Full month name",
-        formula="MONTH_NAMES[month - 1]", input_columns=["timestamp"],
-        output_type="str", category="time",
-    ),
-    FeatureMetadata(
-        name="week_of_year", description="ISO week number (1-53)",
-        formula="datetime.isocalendar().week", input_columns=["timestamp"],
-        output_type="int", category="time", valid_min=1, valid_max=53,
-    ),
-    FeatureMetadata(
-        name="day_of_month", description="Day of month (1-31)",
-        formula="datetime.day", input_columns=["timestamp"],
-        output_type="int", category="time", valid_min=1, valid_max=31,
-    ),
-    FeatureMetadata(
-        name="day_of_week", description="ISO weekday (1=Mon, 7=Sun)",
-        formula="datetime.isoweekday()", input_columns=["timestamp"],
-        output_type="int", category="time", valid_min=1, valid_max=7,
-    ),
-    FeatureMetadata(
-        name="day_name", description="Full day name",
-        formula="DAY_NAMES[weekday - 1]", input_columns=["timestamp"],
-        output_type="str", category="time",
-    ),
-    FeatureMetadata(
-        name="is_weekend", description="True if Saturday or Sunday",
-        formula="day_of_week >= 6", input_columns=["timestamp"],
-        output_type="bool", category="time",
-    ),
-    FeatureMetadata(
-        name="is_business_day", description="True if Monday-Friday",
-        formula="day_of_week <= 5", input_columns=["timestamp"],
-        output_type="bool", category="time",
-    ),
-    FeatureMetadata(
-        name="hour", description="Hour of day (0-23)",
-        formula="datetime.hour", input_columns=["timestamp"],
-        output_type="int", category="time", valid_min=0, valid_max=23,
-    ),
-    FeatureMetadata(
-        name="minute", description="Minute of hour (0-59)",
-        formula="datetime.minute", input_columns=["timestamp"],
-        output_type="int", category="time", valid_min=0, valid_max=59,
-    ),
-    FeatureMetadata(
-        name="season", description="Northern-hemisphere meteorological season",
-        formula="Spring|Summer|Autumn|Winter based on month",
-        input_columns=["timestamp"], output_type="str", category="time",
-    ),
-    FeatureMetadata(
-        name="financial_quarter",
-        description="Financial year quarter (April-March cycle, Q1=Apr-Jun)",
-        formula="((month - 4) % 12) // 3 + 1",
-        input_columns=["timestamp"], output_type="int", category="time",
-        valid_min=1, valid_max=4,
-    ),
-    FeatureMetadata(
-        name="is_holiday",
-        description="True if the date is in the configured holiday set",
-        formula="date in holiday_dates", input_columns=["timestamp"],
-        output_type="bool", category="time",
-    ),
-    FeatureMetadata(
-        name="time_of_day",
-        description="Categorical time bucket: Night/Morning/Afternoon/Evening",
-        formula="bucket(hour)", input_columns=["timestamp"],
-        output_type="str", category="time",
-    ),
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+    "Sunday",
 ]
 
 
-def _register_metadata() -> None:
-    registry.register_many(_TIME_METADATA)
-
-
-_register_metadata()
-
-
 # ---------------------------------------------------------------------------
-# Helper functions
+# Configuration
 # ---------------------------------------------------------------------------
 
 
-def _parse_timestamp(value: Any) -> Optional[datetime]:
-    """Parse a timestamp value to a :class:`datetime` in UTC.
+@dataclass
+class TimeFeaturesConfig:
+    """Configuration for time feature generation.
 
-    Parameters
+    Attributes
     ----------
-    value:
-        ISO-8601 string, Unix epoch float, or ``datetime`` object.
-
-    Returns
-    -------
-    datetime | None
-        Timezone-aware UTC datetime, or ``None`` if unparseable.
+    timestamp_column:
+        Name of the source timestamp column (ISO-8601 UTC string).
+    enabled_features:
+        Set of feature slugs to generate.  ``None`` means *all* features.
+    holidays:
+        Set of date strings in ``"YYYY-MM-DD"`` format treated as public holidays.
     """
-    if value is None or value == "":
-        return None
-    if isinstance(value, datetime):
-        if value.tzinfo is None:
-            return value.replace(tzinfo=timezone.utc)
-        return value.astimezone(timezone.utc)
-    if isinstance(value, (int, float)):
-        try:
-            return datetime.fromtimestamp(value, tz=timezone.utc)
-        except (OSError, OverflowError, ValueError):
-            return None
-    if isinstance(value, str):
-        candidate = value.strip().replace("Z", "+00:00")
-        try:
-            dt = datetime.fromisoformat(candidate)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return dt.astimezone(timezone.utc)
-        except ValueError:
-            return None
-    return None
 
-
-def _season(month: int) -> str:
-    for name, months in _SEASONS:
-        if month in months:
-            return name
-    return "Unknown"
-
-
-def _financial_quarter(month: int) -> int:
-    """April-March financial year: April=Q1, July=Q2, Oct=Q3, Jan=Q4."""
-    return ((month - 4) % 12) // 3 + 1
-
-
-def _time_of_day(hour: int) -> str:
-    for label, low, high in _TIME_BUCKETS:
-        if low <= hour <= high:
-            return label
-    return "Unknown"
+    timestamp_column: str = "timestamp"
+    enabled_features: Optional[Set[str]] = None
+    holidays: Set[str] = field(default_factory=set)
 
 
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
+#: All feature metadata descriptors provided by this module.
+TIME_FEATURE_METADATA: List[FeatureMetadata] = [
+    FeatureMetadata(
+        name="year",
+        description="Calendar year extracted from the timestamp.",
+        formula="datetime.year",
+        input_columns=["timestamp"],
+        output_type="int",
+        category="time",
+        unit="",
+    ),
+    FeatureMetadata(
+        name="quarter",
+        description="Calendar quarter (1-4) extracted from the timestamp.",
+        formula="ceil(month / 3)",
+        input_columns=["timestamp"],
+        output_type="int",
+        category="time",
+        unit="",
+    ),
+    FeatureMetadata(
+        name="month",
+        description="Calendar month (1-12).",
+        formula="datetime.month",
+        input_columns=["timestamp"],
+        output_type="int",
+        category="time",
+        unit="",
+    ),
+    FeatureMetadata(
+        name="month_name",
+        description="Full English name of the month.",
+        formula="MONTH_NAMES[month]",
+        input_columns=["timestamp"],
+        output_type="str",
+        category="time",
+        unit="",
+    ),
+    FeatureMetadata(
+        name="week",
+        description="ISO week number (1-53).",
+        formula="datetime.isocalendar().week",
+        input_columns=["timestamp"],
+        output_type="int",
+        category="time",
+        unit="",
+    ),
+    FeatureMetadata(
+        name="day",
+        description="Day of the month (1-31).",
+        formula="datetime.day",
+        input_columns=["timestamp"],
+        output_type="int",
+        category="time",
+        unit="",
+    ),
+    FeatureMetadata(
+        name="day_of_week",
+        description="Day of week (0=Monday … 6=Sunday).",
+        formula="datetime.weekday()",
+        input_columns=["timestamp"],
+        output_type="int",
+        category="time",
+        unit="",
+    ),
+    FeatureMetadata(
+        name="day_name",
+        description="Full English name of the day.",
+        formula="DAY_NAMES[weekday]",
+        input_columns=["timestamp"],
+        output_type="str",
+        category="time",
+        unit="",
+    ),
+    FeatureMetadata(
+        name="is_weekend",
+        description="True if the day is Saturday or Sunday.",
+        formula="weekday >= 5",
+        input_columns=["timestamp"],
+        output_type="bool",
+        category="time",
+        unit="",
+    ),
+    FeatureMetadata(
+        name="is_business_day",
+        description="True if the day is Monday through Friday.",
+        formula="weekday < 5",
+        input_columns=["timestamp"],
+        output_type="bool",
+        category="time",
+        unit="",
+    ),
+    FeatureMetadata(
+        name="is_holiday",
+        description="True if the date appears in the configured holiday set.",
+        formula="date_str in holidays",
+        input_columns=["timestamp"],
+        output_type="bool",
+        category="time",
+        unit="",
+    ),
+    FeatureMetadata(
+        name="hour",
+        description="Hour of the day (0-23).",
+        formula="datetime.hour",
+        input_columns=["timestamp"],
+        output_type="int",
+        category="time",
+        unit="",
+    ),
+    FeatureMetadata(
+        name="minute",
+        description="Minute of the hour (0-59).",
+        formula="datetime.minute",
+        input_columns=["timestamp"],
+        output_type="int",
+        category="time",
+        unit="",
+    ),
+    FeatureMetadata(
+        name="season",
+        description="Meteorological season (Northern Hemisphere).",
+        formula="MONTH_TO_SEASON[month]",
+        input_columns=["timestamp"],
+        output_type="str",
+        category="time",
+        unit="",
+    ),
+    FeatureMetadata(
+        name="financial_quarter",
+        description="Financial quarter label (April fiscal-year start).",
+        formula="MONTH_TO_FIN_QUARTER[month]",
+        input_columns=["timestamp"],
+        output_type="str",
+        category="time",
+        unit="",
+    ),
+]
+
+_ALL_TIME_FEATURES = {m.name for m in TIME_FEATURE_METADATA}
+
+
+def _parse_utc(value: Any) -> Optional[datetime]:
+    """Parse an ISO-8601 string to a UTC-aware datetime.
+
+    Parameters
+    ----------
+    value:
+        Raw timestamp value from the record.
+
+    Returns
+    -------
+    datetime | None
+        ``None`` if the value cannot be parsed.
+    """
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        return value.astimezone(timezone.utc)
+    try:
+        candidate = str(value).strip().replace("Z", "+00:00")
+        dt = datetime.fromisoformat(candidate)
+        return dt.astimezone(timezone.utc)
+    except (ValueError, TypeError):
+        return None
+
 
 def add_time_features(
     records: List[Dict[str, Any]],
-    timestamp_column: str = "timestamp",
-    holiday_dates: Optional[Set[str]] = None,
-) -> Tuple[List[Dict[str, Any]], List[str]]:
-    """Add temporal features to every record in *records*.
+    config: Optional[TimeFeaturesConfig] = None,
+) -> Tuple[List[Dict[str, Any]], List[str], List[str]]:
+    """Add time-based feature columns to every record.
 
     Parameters
     ----------
     records:
         Mutable list of record dictionaries (modified in-place).
-    timestamp_column:
-        Name of the column containing the timestamp value.
-    holiday_dates:
-        Set of ISO date strings (``"YYYY-MM-DD"``) treated as holidays.
-        If ``None`` or empty, ``is_holiday`` is always ``False``.
+    config:
+        :class:`TimeFeaturesConfig` instance.  Defaults to
+        ``TimeFeaturesConfig()`` (all features, column ``"timestamp"``).
 
     Returns
     -------
-    tuple[list[dict], list[str]]
-        ``(records, warnings)``
-
-        - *records*: The same list, enriched with time features.
-        - *warnings*: Non-fatal issues (e.g. unparseable timestamps).
+    tuple[list[dict], list[str], list[str]]
+        ``(records, added_columns, warnings)``
     """
-    holidays: Set[str] = holiday_dates or set()
+    cfg = config or TimeFeaturesConfig()
+    enabled = cfg.enabled_features or _ALL_TIME_FEATURES
+    added_columns: List[str] = []
     warnings: List[str] = []
+    col = cfg.timestamp_column
 
-    for row_index, record in enumerate(records):
-        raw = record.get(timestamp_column)
-        dt = _parse_timestamp(raw)
+    for row_idx, record in enumerate(records):
+        raw = record.get(col)
+        dt = _parse_utc(raw)
+
         if dt is None:
-            warnings.append(
-                f"Cannot parse timestamp at row {row_index}: {raw!r}."
-                f" Time features set to None."
-            )
-            _set_null_time_features(record)
+            if raw is not None:
+                warnings.append(f"Could not parse timestamp at row {row_idx}: {raw!r}")
+            # Write None for all enabled features so the row is complete
+            for feat in sorted(enabled):
+                if feat not in record:
+                    record[feat] = None
+                    if feat not in added_columns:
+                        added_columns.append(feat)
             continue
 
+        weekday = dt.weekday()
         month = dt.month
-        dow = dt.isoweekday()  # 1=Mon, 7=Sun
+        date_str = dt.strftime("%Y-%m-%d")
 
-        record["year"] = dt.year
-        record["quarter"] = (month - 1) // 3 + 1
-        record["month"] = month
-        record["month_name"] = _MONTH_NAMES[month - 1]
-        record["week_of_year"] = dt.isocalendar()[1]
-        record["day_of_month"] = dt.day
-        record["day_of_week"] = dow
-        record["day_name"] = _DAY_NAMES[dow - 1]
-        record["is_weekend"] = dow >= 6
-        record["is_business_day"] = dow <= 5
-        record["hour"] = dt.hour
-        record["minute"] = dt.minute
-        record["season"] = _season(month)
-        record["financial_quarter"] = _financial_quarter(month)
-        record["is_holiday"] = dt.strftime("%Y-%m-%d") in holidays
-        record["time_of_day"] = _time_of_day(dt.hour)
+        feature_map: Dict[str, Any] = {
+            "year": dt.year,
+            "quarter": (month - 1) // 3 + 1,
+            "month": month,
+            "month_name": _MONTH_NAMES[month],
+            "week": dt.isocalendar()[1],
+            "day": dt.day,
+            "day_of_week": weekday,
+            "day_name": _DAY_NAMES[weekday],
+            "is_weekend": weekday >= 5,
+            "is_business_day": weekday < 5,
+            "is_holiday": date_str in cfg.holidays,
+            "hour": dt.hour,
+            "minute": dt.minute,
+            "season": _MONTH_TO_SEASON[month],
+            "financial_quarter": _MONTH_TO_FIN_QUARTER[month],
+        }
 
-    return records, warnings
+        for feat, val in feature_map.items():
+            if feat in enabled:
+                record[feat] = val
+                if feat not in added_columns:
+                    added_columns.append(feat)
+
+    return records, added_columns, warnings
 
 
-def _set_null_time_features(record: Dict[str, Any]) -> None:
-    """Set all time features to ``None`` for rows with unparseable timestamps."""
-    for col in [
-        "year", "quarter", "month", "month_name", "week_of_year",
-        "day_of_month", "day_of_week", "day_name", "is_weekend",
-        "is_business_day", "hour", "minute", "season", "financial_quarter",
-        "is_holiday", "time_of_day",
-    ]:
-        record[col] = None
+# Re-export Tuple for callers that use it from this module
+from typing import Tuple  # noqa: E402

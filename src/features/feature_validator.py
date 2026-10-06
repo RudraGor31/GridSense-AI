@@ -1,142 +1,185 @@
-"""Feature validation for Phase 4.3 – post-computation quality gate.
+"""Feature validation utilities for Phase 4.3.
 
-:func:`validate_features` inspects a list of feature-enriched record dicts and
-reports:
+Validates engineered feature datasets for common data-quality issues before
+they are persisted.  The validator is deliberately non-destructive — it only
+reports issues as warnings or errors; it never modifies the records.
 
-- Missing values in feature columns (``None`` / ``""``)
-- Infinite values (``math.isinf``)
-- NaN values (``math.isnan``)
-- Values outside the configured valid range (``valid_min`` / ``valid_max``)
-- Duplicate feature column names within a single record
-- Invalid type coercions (non-numeric values in numeric features)
-
-The validator is **non-destructive** — it never modifies records.  All issues
-are collected as warning strings and returned alongside summary counts.
+Checks performed
+----------------
+- Missing values (``None`` or empty string) in feature columns.
+- Infinite values (``float("inf")``, ``float("-inf")``).
+- NaN values (``float("nan")``).
+- Unexpected value ranges (configurable per feature).
+- Duplicate feature columns.
+- Invalid calculations (non-numeric values in numeric feature columns).
 """
 
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
-from src.features.feature_metadata import FeatureMetadata
+
+@dataclass
+class FeatureValidationResult:
+    """Result of a feature validation pass.
+
+    Attributes
+    ----------
+    dataset:
+        Name of the dataset that was validated.
+    feature_columns:
+        Feature column names that were inspected.
+    total_rows:
+        Number of rows validated.
+    missing_count:
+        Cells with ``None`` or empty-string values.
+    infinite_count:
+        Cells with ``±inf`` values.
+    nan_count:
+        Cells with ``NaN`` values.
+    out_of_range_count:
+        Cells that violate configured numeric bounds.
+    duplicate_columns:
+        Feature column names that appear more than once across the record keys.
+    invalid_calc_count:
+        Non-numeric cells in columns declared as numeric features.
+    warnings:
+        Non-fatal issue messages.
+    errors:
+        Fatal issue messages (e.g. duplicate columns).
+    is_valid:
+        ``True`` if there are no errors (warnings are permitted).
+    """
+
+    dataset: str
+    feature_columns: List[str]
+    total_rows: int = 0
+    missing_count: int = 0
+    infinite_count: int = 0
+    nan_count: int = 0
+    out_of_range_count: int = 0
+    duplicate_columns: List[str] = field(default_factory=list)
+    invalid_calc_count: int = 0
+    warnings: List[str] = field(default_factory=list)
+    errors: List[str] = field(default_factory=list)
+    is_valid: bool = True
+
+    def _recompute_validity(self) -> None:
+        self.is_valid = len(self.errors) == 0
 
 
-def _safe_float(value: Any) -> Optional[float]:
-    """Try to coerce *value* to float; return ``None`` on failure."""
-    if value is None or value == "":
-        return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def validate_features(
-    records: List[Dict[str, Any]],
-    feature_columns: List[str],
-    metadata_map: Dict[str, FeatureMetadata],
-) -> Tuple[Dict[str, int], List[str]]:
-    """Validate feature columns across all records.
+class FeatureValidator:
+    """Validate engineered feature records for data-quality issues.
 
     Parameters
     ----------
-    records:
-        Feature-enriched dataset rows.
-    feature_columns:
-        List of feature column names to validate.
-    metadata_map:
-        Mapping of feature name → :class:`FeatureMetadata` for range bounds.
-
-    Returns
-    -------
-    tuple[dict[str, int], list[str]]
-        ``(summary_counts, warning_messages)``
-
-        Summary keys:
-
-        - ``"missing"``   — cells that are ``None`` or ``""``
-        - ``"infinite"``  — cells containing ``math.inf`` or ``-math.inf``
-        - ``"nan"``       — cells containing ``math.nan``
-        - ``"out_of_range"`` — cells outside ``[valid_min, valid_max]``
-        - ``"type_errors"``  — non-numeric values in numeric feature columns
-        - ``"total_checked"`` — total (row × column) cells inspected
+    numeric_columns:
+        Feature column names that are expected to hold numeric values.
+        Non-numeric values in these columns are counted as invalid calculations.
+    range_bounds:
+        Optional per-column numeric bounds ``{column: (min, max)}``.  Values
+        outside these bounds are reported as out-of-range warnings.
+    allow_missing:
+        If ``True``, missing values produce warnings rather than errors.
     """
-    summary: Dict[str, int] = {
-        "missing": 0,
-        "infinite": 0,
-        "nan": 0,
-        "out_of_range": 0,
-        "type_errors": 0,
-        "total_checked": 0,
-    }
-    warnings: List[str] = []
 
-    # Check for duplicate column names in feature list
-    seen: set[str] = set()
-    for col in feature_columns:
-        if col in seen:
-            warnings.append(f"Duplicate feature column name detected: '{col}'.")
-        seen.add(col)
+    def __init__(
+        self,
+        numeric_columns: Optional[List[str]] = None,
+        range_bounds: Optional[Dict[str, Tuple[float, float]]] = None,
+        allow_missing: bool = True,
+    ) -> None:
+        self._numeric_columns = set(numeric_columns or [])
+        self._range_bounds = range_bounds or {}
+        self._allow_missing = allow_missing
 
-    for row_index, record in enumerate(records):
-        for col in feature_columns:
-            summary["total_checked"] += 1
-            value = record.get(col)
-            meta = metadata_map.get(col)
+    def validate(
+        self,
+        records: List[Dict[str, Any]],
+        dataset: str,
+        feature_columns: List[str],
+    ) -> FeatureValidationResult:
+        """Run all validation checks on *records*.
 
-            # ---- Missing ----
-            if value is None or value == "":
-                summary["missing"] += 1
-                warnings.append(
-                    f"Missing value | row={row_index} | feature='{col}'."
-                )
-                continue
+        Parameters
+        ----------
+        records:
+            Engineered feature records to validate.
+        dataset:
+            Dataset name for the result report.
+        feature_columns:
+            Feature column names to inspect.
 
-            # ---- Type check for numeric features ----
-            f_value = _safe_float(value)
-            if meta is not None and meta.output_type in ("float", "int"):
-                if f_value is None:
-                    summary["type_errors"] += 1
-                    warnings.append(
-                        f"Type error | row={row_index} | feature='{col}'"
-                        f" | value={value!r} (expected numeric)."
-                    )
+        Returns
+        -------
+        FeatureValidationResult
+        """
+        result = FeatureValidationResult(
+            dataset=dataset,
+            feature_columns=list(feature_columns),
+            total_rows=len(records),
+        )
+
+        # ---- Duplicate column check (across keys of first record) ----
+        if records:
+            all_keys = list(records[0].keys())
+            seen: set[str] = set()
+            dupes: List[str] = []
+            for k in all_keys:
+                if k in feature_columns:
+                    if k in seen:
+                        dupes.append(k)
+                    seen.add(k)
+            if dupes:
+                result.duplicate_columns = dupes
+                result.errors.append(f"Duplicate feature columns detected: {dupes}")
+
+        # ---- Per-row checks ----
+        for row_idx, record in enumerate(records):
+            for col in feature_columns:
+                value = record.get(col)
+
+                # Missing
+                if value is None or value == "":
+                    result.missing_count += 1
+                    msg = f"Missing value | row={row_idx} | column={col}"
+                    if self._allow_missing:
+                        result.warnings.append(msg)
+                    else:
+                        result.errors.append(msg)
                     continue
 
-            if f_value is None:
-                continue  # non-numeric feature type, skip numeric checks
+                # Numeric checks
+                if col in self._numeric_columns:
+                    try:
+                        fval = float(value)  # type: ignore[arg-type]
+                    except (TypeError, ValueError):
+                        result.invalid_calc_count += 1
+                        result.warnings.append(
+                            f"Non-numeric value | row={row_idx} | column={col} | value={value!r}"
+                        )
+                        continue
 
-            # ---- Infinite ----
-            if math.isinf(f_value):
-                summary["infinite"] += 1
-                warnings.append(
-                    f"Infinite value | row={row_index} | feature='{col}'"
-                    f" | value={f_value}."
-                )
-                continue
+                    if math.isinf(fval):
+                        result.infinite_count += 1
+                        result.warnings.append(
+                            f"Infinite value | row={row_idx} | column={col}"
+                        )
+                    elif math.isnan(fval):
+                        result.nan_count += 1
+                        result.warnings.append(
+                            f"NaN value | row={row_idx} | column={col}"
+                        )
+                    elif col in self._range_bounds:
+                        lo, hi = self._range_bounds[col]
+                        if fval < lo or fval > hi:
+                            result.out_of_range_count += 1
+                            result.warnings.append(
+                                f"Out-of-range | row={row_idx} | column={col}"
+                                f" | value={fval} | expected=[{lo}, {hi}]"
+                            )
 
-            # ---- NaN ----
-            if math.isnan(f_value):
-                summary["nan"] += 1
-                warnings.append(
-                    f"NaN value | row={row_index} | feature='{col}'."
-                )
-                continue
-
-            # ---- Range check ----
-            if meta is not None:
-                if meta.valid_min is not None and f_value < meta.valid_min:
-                    summary["out_of_range"] += 1
-                    warnings.append(
-                        f"Out-of-range | row={row_index} | feature='{col}'"
-                        f" | value={f_value} < min={meta.valid_min}."
-                    )
-                elif meta.valid_max is not None and f_value > meta.valid_max:
-                    summary["out_of_range"] += 1
-                    warnings.append(
-                        f"Out-of-range | row={row_index} | feature='{col}'"
-                        f" | value={f_value} > max={meta.valid_max}."
-                    )
-
-    return summary, warnings
+        result._recompute_validity()
+        return result
